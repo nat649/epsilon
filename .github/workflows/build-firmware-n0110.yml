@@ -22,6 +22,10 @@ name: Firmware N0110 (Renode)
 on:
   workflow_dispatch:
     inputs:
+      repository:
+        description: "Depot source (un fork n'herite PAS des tags, d'ou ce champ)"
+        default: "numworks/epsilon"
+        required: true
       ref:
         description: "Tag ou branche a compiler"
         default: "15.5.0"
@@ -37,6 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.event.inputs.repository }}
           ref: ${{ github.event.inputs.ref }}
 
       - name: Dependances
