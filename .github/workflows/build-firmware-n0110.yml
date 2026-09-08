@@ -1,0 +1,96 @@
+# .github/workflows/build-firmware-n0110.yml
+#
+# Compile le firmware NumWorks N0110 et produit les deux images que
+# l'emulateur Renode charge :
+#     epsilon.onboarding.internal.bin  -> 0x08000000  (bootloader + kernel)
+#     epsilon.onboarding.external.bin  -> 0x90000000  (userland + apps)
+#
+# Cible le tag 15.5.0 : derniere version dont les drivers kernel (ecran FMC/ST7789,
+# matrice clavier) sont publics -- c'est la version que l'emulateur reproduit.
+#
+# Utilisation :
+#   1. Fork de https://github.com/numworks/epsilon
+#   2. Ajouter CE fichier dans .github/workflows/ sur la branche par defaut
+#      (pas besoin de creer une branche : le checkout ci-dessous cible le tag)
+#   3. Actions -> "Firmware N0110 (Renode)" -> Run workflow
+#   4. Recuperer l'artifact "firmware-n0110-renode"
+#
+# Pour compiler TON firmware modifie : mettre ta branche dans le champ "ref".
+
+name: Firmware N0110 (Renode)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag ou branche a compiler"
+        default: "15.5.0"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Dependances
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential imagemagick \
+            libfreetype6-dev libjpeg-dev libpng-dev pkg-config python3
+
+      - name: Toolchain ARM
+        uses: numworks/setup-arm-toolchain@2020-q2
+
+      # ATTENTION : dans Epsilon 15.x le N0110 est la cible PAR DEFAUT.
+      # Ni PLATFORM=device ni MODEL=n0110 (PLATFORM=device n'existe pas) :
+      # c'est exactement ce qui faisait echouer ce workflow.
+      - name: Compiler
+        run: make -j$(nproc) epsilon.onboarding.dfu
+
+      - name: Extraire internal.bin / external.bin depuis le DFU
+        run: |
+          mkdir -p fw
+          DFU=$(find output -name 'epsilon.onboarding.dfu' | head -n1)
+          echo "DFU trouve : $DFU"
+          cp "$DFU" fw/
+          cat > split_dfu.py <<'PY'
+          import struct, sys, os
+          data = open(sys.argv[1], 'rb').read()
+          outdir = sys.argv[2]
+          assert data[:5] == b'DfuSe', "pas un fichier DfuSe"
+          ntargets = data[10]
+          off = 11
+          for _ in range(ntargets):
+              assert data[off:off+6] == b'Target', "entete Target invalide"
+              nelem = struct.unpack('<I', data[off+270:off+274])[0]
+              off += 274
+              for _ in range(nelem):
+                  addr, size = struct.unpack('<II', data[off:off+8])
+                  off += 8
+                  blob = data[off:off+size]
+                  off += size
+                  if addr == 0x08000000:
+                      name = 'epsilon.onboarding.internal.bin'
+                  elif addr == 0x90000000:
+                      name = 'epsilon.onboarding.external.bin'
+                  else:
+                      name = 'segment_%08X.bin' % addr
+                  open(os.path.join(outdir, name), 'wb').write(blob)
+                  print('%-34s 0x%08X  %d octets' % (name, addr, size))
+          PY
+          python3 split_dfu.py "$DFU" fw
+          find output -name '*.elf' -exec cp -v {} fw/ \; || true
+          ls -la fw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-n0110-renode
+          path: fw/*
+          if-no-files-found: error
