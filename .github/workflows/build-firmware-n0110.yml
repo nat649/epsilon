@@ -1,9 +1,16 @@
 # .github/workflows/build-firmware-n0110.yml
 #
-# Compile le firmware NumWorks N0110 et produit les deux images que
-# l'emulateur Renode charge :
-#     epsilon.onboarding.internal.bin  -> 0x08000000  (bootloader + kernel)
-#     epsilon.onboarding.external.bin  -> 0x90000000  (userland + apps)
+# Compile le firmware NumWorks N0110 et produit les images que l'emulateur
+# Renode charge, dans les DEUX variantes :
+#
+#   epsilon.onboarding.internal.bin / .external.bin
+#       avec l'assistant de premiere utilisation (choix langue/pays)
+#   epsilon.internal.bin / .external.bin
+#       sans l'assistant -> demarre directement sur l'ecran d'accueil,
+#       c'est la variante que le lanceur NumWorks.bat utilise
+#
+# La variante est choisie dans apps/Makefile par le suffixe -onboarding /
+# +onboarding : la cible "epsilon" prend apps_container_launch_default.cpp.
 #
 # Cible le tag 15.5.0 : derniere version dont les drivers kernel (ecran FMC/ST7789,
 # matrice clavier) sont publics -- c'est la version que l'emulateur reproduit.
@@ -11,11 +18,11 @@
 # Utilisation :
 #   1. Fork de https://github.com/numworks/epsilon
 #   2. Ajouter CE fichier dans .github/workflows/ sur la branche par defaut
-#      (pas besoin de creer une branche : le checkout ci-dessous cible le tag)
 #   3. Actions -> "Firmware N0110 (Renode)" -> Run workflow
 #   4. Recuperer l'artifact "firmware-n0110-renode"
 #
-# Pour compiler TON firmware modifie : mettre ta branche dans le champ "ref".
+# Pour compiler TON firmware modifie : mettre ton fork dans "repository" et ta
+# branche dans "ref" (un fork n'heritant pas des tags, les deux champs comptent).
 
 name: Firmware N0110 (Renode)
 
@@ -56,19 +63,19 @@ jobs:
       # ATTENTION : dans Epsilon 15.x le N0110 est la cible PAR DEFAUT.
       # Ni PLATFORM=device ni MODEL=n0110 (PLATFORM=device n'existe pas) :
       # c'est exactement ce qui faisait echouer ce workflow.
-      - name: Compiler
+      - name: Compiler (avec assistant)
         run: make -j$(nproc) epsilon.onboarding.dfu
 
-      - name: Extraire internal.bin / external.bin depuis le DFU
+      - name: Compiler (sans assistant)
+        run: make -j$(nproc) epsilon.dfu
+
+      - name: Extraire internal.bin / external.bin depuis les DFU
         run: |
           mkdir -p fw
-          DFU=$(find output -name 'epsilon.onboarding.dfu' | head -n1)
-          echo "DFU trouve : $DFU"
-          cp "$DFU" fw/
           cat > split_dfu.py <<'PY'
           import struct, sys, os
           data = open(sys.argv[1], 'rb').read()
-          outdir = sys.argv[2]
+          outdir, prefix = sys.argv[2], sys.argv[3]
           assert data[:5] == b'DfuSe', "pas un fichier DfuSe"
           ntargets = data[10]
           off = 11
@@ -82,15 +89,21 @@ jobs:
                   blob = data[off:off+size]
                   off += size
                   if addr == 0x08000000:
-                      name = 'epsilon.onboarding.internal.bin'
+                      name = prefix + '.internal.bin'
                   elif addr == 0x90000000:
-                      name = 'epsilon.onboarding.external.bin'
+                      name = prefix + '.external.bin'
                   else:
-                      name = 'segment_%08X.bin' % addr
+                      name = '%s.segment_%08X.bin' % (prefix, addr)
                   open(os.path.join(outdir, name), 'wb').write(blob)
                   print('%-34s 0x%08X  %d octets' % (name, addr, size))
           PY
-          python3 split_dfu.py "$DFU" fw
+          for target in epsilon.onboarding epsilon; do
+            DFU=$(find output -name "$target.dfu" | head -n1)
+            if [ -z "$DFU" ]; then echo "::error::$target.dfu introuvable"; exit 1; fi
+            echo "DFU trouve : $DFU"
+            cp "$DFU" fw/
+            python3 split_dfu.py "$DFU" fw "$target"
+          done
           find output -name '*.elf' -exec cp -v {} fw/ \; || true
           ls -la fw
 
