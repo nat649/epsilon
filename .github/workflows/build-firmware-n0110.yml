@@ -1,46 +1,17 @@
-# .github/workflows/build-firmware-n0110.yml
-#
-# Compile le firmware NumWorks N0110 et produit les images que l'emulateur
-# Renode charge, dans les DEUX variantes :
-#
-#   epsilon.onboarding.internal.bin / .external.bin
-#       avec l'assistant de premiere utilisation (choix langue/pays)
-#   epsilon.internal.bin / .external.bin
-#       sans l'assistant -> demarre directement sur l'ecran d'accueil,
-#       c'est la variante que le lanceur NumWorks.bat utilise
-#
-# La variante est choisie dans apps/Makefile par le suffixe -onboarding /
-# +onboarding : la cible "epsilon" prend apps_container_launch_default.cpp.
-#
-# Cible le tag 15.5.0 : derniere version dont les drivers kernel (ecran FMC/ST7789,
-# matrice clavier) sont publics -- c'est la version que l'emulateur reproduit.
-#
-# Utilisation :
-#   1. Fork de https://github.com/numworks/epsilon
-#   2. Ajouter CE fichier dans .github/workflows/ sur la branche par defaut
-#   3. Actions -> "Firmware N0110 (Renode)" -> Run workflow
-#   4. Recuperer l'artifact "firmware-n0110-renode"
-#
-# Pour compiler TON firmware modifie : mettre ton fork dans "repository" et ta
-# branche dans "ref" (un fork n'heritant pas des tags, les deux champs comptent).
-
 name: Firmware N0110 (Renode)
-
 on:
   workflow_dispatch:
     inputs:
       repository:
-        description: "Depot source (un fork n'herite PAS des tags, d'ou ce champ)"
-        default: "numworks/epsilon"
+        description: Source repository
+        default: numworks/epsilon
         required: true
       ref:
-        description: "Tag ou branche a compiler"
-        default: "15.5.0"
+        description: Source tag, branch or commit
+        default: '15.5.0'
         required: true
-
 permissions:
   contents: read
-
 jobs:
   firmware:
     runs-on: ubuntu-22.04
@@ -48,65 +19,57 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.inputs.repository }}
-          ref: ${{ github.event.inputs.ref }}
-
-      - name: Dependances
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential imagemagick \
-            libfreetype6-dev libjpeg-dev libpng-dev pkg-config python3
-
-      - name: Toolchain ARM
+          sudo apt-get install -y build-essential imagemagick libfreetype6-dev libjpeg-dev libpng-dev pkg-config python3
+      - name: Install ARM toolchain
         uses: numworks/setup-arm-toolchain@2020-q2
-
-      # ATTENTION : dans Epsilon 15.x le N0110 est la cible PAR DEFAUT.
-      # Ni PLATFORM=device ni MODEL=n0110 (PLATFORM=device n'existe pas) :
-      # c'est exactement ce qui faisait echouer ce workflow.
-      - name: Compiler (avec assistant)
-        run: make -j$(nproc) epsilon.onboarding.dfu
-
-      - name: Compiler (sans assistant)
-        run: make -j$(nproc) epsilon.dfu
-
-      - name: Extraire internal.bin / external.bin depuis les DFU
+      - name: Build onboarding firmware
+        run: make -j2 epsilon.onboarding.dfu
+      - name: Build standard firmware
+        run: make -j2 epsilon.dfu
+      - name: Extract firmware images and record source revision
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.repository }}
         run: |
           mkdir -p fw
           cat > split_dfu.py <<'PY'
-          import struct, sys, os
-          data = open(sys.argv[1], 'rb').read()
-          outdir, prefix = sys.argv[2], sys.argv[3]
-          assert data[:5] == b'DfuSe', "pas un fichier DfuSe"
-          ntargets = data[10]
-          off = 11
-          for _ in range(ntargets):
-              assert data[off:off+6] == b'Target', "entete Target invalide"
-              nelem = struct.unpack('<I', data[off+270:off+274])[0]
-              off += 274
-              for _ in range(nelem):
-                  addr, size = struct.unpack('<II', data[off:off+8])
-                  off += 8
-                  blob = data[off:off+size]
-                  off += size
-                  if addr == 0x08000000:
-                      name = prefix + '.internal.bin'
-                  elif addr == 0x90000000:
-                      name = prefix + '.external.bin'
-                  else:
-                      name = '%s.segment_%08X.bin' % (prefix, addr)
-                  open(os.path.join(outdir, name), 'wb').write(blob)
-                  print('%-34s 0x%08X  %d octets' % (name, addr, size))
+          import json, os, pathlib, struct, subprocess
+          out = pathlib.Path('fw')
+          for target in ('epsilon.onboarding', 'epsilon'):
+              path = next(pathlib.Path('output').rglob(target + '.dfu'))
+              data = path.read_bytes()
+              assert data[:5] == b'DfuSe', 'Invalid DFU signature'
+              (out / path.name).write_bytes(data)
+              offset = 11
+              found = set()
+              for _ in range(data[10]):
+                  assert data[offset:offset+6] == b'Target', 'Invalid target header'
+                  count = struct.unpack_from('<I', data, offset + 270)[0]
+                  offset += 274
+                  for _ in range(count):
+                      address, size = struct.unpack_from('<II', data, offset)
+                      offset += 8
+                      blob = data[offset:offset+size]
+                      assert len(blob) == size, 'Truncated element'
+                      offset += size
+                      suffix = {0x08000000: 'internal', 0x90000000: 'external'}.get(address, 'segment_%08X' % address)
+                      (out / (target + '.' + suffix + '.bin')).write_bytes(blob)
+                      found.add(address)
+                      print(target, suffix, hex(address), size)
+              assert {0x08000000, 0x90000000} <= found, 'Missing firmware image'
+          for path in pathlib.Path('output').rglob('epsilon*.elf'):
+              (out / path.name).write_bytes(path.read_bytes())
+          for path in pathlib.Path('.').glob('LICENSE*'):
+              if path.is_file():
+                  (out / path.name).write_bytes(path.read_bytes())
+          (out / 'source.json').write_text(json.dumps({'repository': os.environ['SOURCE_REPOSITORY'], 'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'submodules': subprocess.check_output(['git', 'submodule', 'status', '--recursive'], text=True)}, indent=2) + '\n')
           PY
-          for target in epsilon.onboarding epsilon; do
-            DFU=$(find output -name "$target.dfu" | head -n1)
-            if [ -z "$DFU" ]; then echo "::error::$target.dfu introuvable"; exit 1; fi
-            echo "DFU trouve : $DFU"
-            cp "$DFU" fw/
-            python3 split_dfu.py "$DFU" fw "$target"
-          done
-          find output -name '*.elf' -exec cp -v {} fw/ \; || true
-          ls -la fw
-
+          python3 split_dfu.py
       - uses: actions/upload-artifact@v4
         with:
           name: firmware-n0110-renode
